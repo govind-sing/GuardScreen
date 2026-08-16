@@ -3,7 +3,8 @@ from logging.config import fileConfig
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 from app.config import settings
-from app.models.request_log import Base
+from app.core.db import Base
+import app.models  # noqa: F401 — side-effect import, registers all models on Base.metadata
 from alembic import context
 
 # this is the Alembic Config object, which provides

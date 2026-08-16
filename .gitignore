@@ -1,46 +1,23 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-*.egg-info/
-*.egg
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-
-# Environment variables / secrets
+# secrets
 .env
-.env.*
+gateway/.env
 !.env.example
 
-# Alembic
-# (keep versions/ tracked — migration history should be in git)
-# but ignore any local sqlite fallback db if ever used
-*.sqlite3
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Docker
+# docker
 *.log
 
-# OS
+# editor/OS
 .DS_Store
-Thumbs.db
-
-# IDE
 .vscode/
 .idea/
-*.swp
-
-# Testing / coverage
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Build artifacts
-build/
-dist/
-*.egg-info/
