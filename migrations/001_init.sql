@@ -27,14 +27,16 @@ CREATE INDEX idx_request_log_idempotency_key ON request_log(idempotency_key);
 
 -- candidates table (reference only — Alembic migration is authoritative)
 CREATE TABLE candidates (
-    id UUID PRIMARY KEY DEFAULT,
+    id UUID PRIMARY KEY,  -- generated app-side (uuid.uuid4()), not DB-side
     request_id UUID NOT NULL REFERENCES request_log(id),
     original_filename VARCHAR NOT NULL,
     file_type VARCHAR NOT NULL,
     storage_bucket VARCHAR NOT NULL,
     storage_key VARCHAR NOT NULL,
     extracted_text TEXT,
+    jd_text TEXT NOT NULL,
     is_resume BOOLEAN,
+    jd_valid BOOLEAN,
     score FLOAT,
     score_reasoning TEXT,
     status VARCHAR NOT NULL DEFAULT 'queued',
@@ -45,7 +47,6 @@ CREATE TABLE candidates (
 
 CREATE INDEX ix_candidates_request_id ON candidates (request_id);
 
--- Phase 1 addition: request_log gets its deferred FK now that candidates exists
 ALTER TABLE request_log
     ADD CONSTRAINT fk_request_log_candidate_id
     FOREIGN KEY (candidate_id) REFERENCES candidates(id);

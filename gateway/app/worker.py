@@ -8,25 +8,19 @@ from app.config import settings
 from app.core.db import SessionLocal
 from app.core.exceptions import GuardScreenError
 from app.models.candidate import Candidate
-from app.services import storage, parsing
+from app.services import storage, parsing, screening
 
 MIN_WORDS_BEFORE_OCR_FALLBACK = 20  # placeholder threshold — revisit once we build OCR
 
 
 async def process_candidate(ctx, candidate_id: str) -> None:
     """
-    Single arq task covering the pipeline through parsing:
-    download from MinIO -> extract text -> (OCR fallback, not yet built)
-    -> save extracted_text, set status="scoring".
-
-    Scoring itself is added here once services/screening.py exists —
-    not a separate arq job, just the next step in this same function.
+    Full Phase 1 pipeline: download -> extract -> (OCR fallback, not yet
+    built) -> score -> save. Naive baseline — no retries, no guardrails.
     """
     async with SessionLocal() as session:
         candidate = await session.get(Candidate, uuid.UUID(candidate_id))
         if candidate is None:
-            # Shouldn't happen — the row is written before the job is enqueued.
-            # Nothing to update if it doesn't exist; just log and stop.
             print(f"[worker] candidate {candidate_id} not found, skipping")
             return
 
@@ -38,8 +32,6 @@ async def process_candidate(ctx, candidate_id: str) -> None:
             text = await asyncio.to_thread(parsing.extract_text, file_bytes, candidate.file_type)
 
             if len(text.split()) < MIN_WORDS_BEFORE_OCR_FALLBACK:
-                # OCR fallback goes here once built — for now, treat as a failure
-                # so it's visible rather than silently scored on near-empty text.
                 candidate.status = "failed"
                 candidate.error_detail = "Extracted text too short — likely a scanned PDF, OCR not yet implemented"
                 await session.commit()
@@ -49,8 +41,19 @@ async def process_candidate(ctx, candidate_id: str) -> None:
             candidate.status = "scoring"
             await session.commit()
 
-            # TODO: call services/screening.py here once it exists —
-            # sets is_resume, score, score_reasoning, final status="done"
+            result = await asyncio.to_thread(screening.score_resume, text, candidate.jd_text)
+
+            candidate.is_resume = result["is_resume"]
+            candidate.jd_valid = result["jd_valid"]
+            candidate.score = result["score"]
+            candidate.score_reasoning = result["reasoning"]
+
+            if not result["is_resume"] or not result["jd_valid"]:
+                candidate.status = "rejected_not_resume"
+            else:
+                candidate.status = "done"
+
+            await session.commit()
 
         except GuardScreenError as e:
             candidate.status = "failed"
@@ -62,4 +65,4 @@ class WorkerSettings:
     functions = [process_candidate]
     redis_settings = RedisSettings.from_dsn(settings.arq_redis_url)
     job_timeout = 120
-    max_tries = 1  # no retries for now, per decision
+    max_tries = 1

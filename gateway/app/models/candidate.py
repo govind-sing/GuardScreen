@@ -29,7 +29,9 @@ class Candidate(Base):
     storage_key: Mapped[str] = mapped_column(String, nullable=False)
 
     extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    jd_text: Mapped[str] = mapped_column(Text, nullable=False)
     is_resume: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    jd_valid: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
     score_reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
 

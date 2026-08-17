@@ -1,14 +1,15 @@
 """
 Throwaway script to manually verify the worker end-to-end:
 creates the FK chain (agent -> request_log -> candidate), uploads
-a real file to MinIO, then enqueues an arq job and lets the worker
-process it. Not part of the app — delete once confirmed working.
+a real file to MinIO, enqueues an arq job, then polls the candidates
+row until the worker reaches a terminal status and prints the result.
+Not part of the app — delete once confirmed working.
 
 Usage:
     python scratch_test_worker.py /path/to/your/resume.pdf
 
-Run this, then separately run the worker in another terminal:
-    arq app.worker.WorkerSettings
+Run the worker separately first (or it must already be running):
+    docker-compose up -d worker
 """
 import asyncio
 import sys
@@ -22,6 +23,28 @@ from app.core.db import SessionLocal
 from app.models.request_log import Agent, RequestLog
 from app.models.candidate import Candidate
 from app.services.storage import upload_file
+
+JD_TEXT = """
+We are hiring a Backend Engineer with strong experience in Python, FastAPI,
+PostgreSQL, and AWS. Experience with Docker and CI/CD pipelines is a plus.
+"""
+
+TERMINAL_STATUSES = {"done", "rejected_not_resume", "failed"}
+POLL_INTERVAL_SECONDS = 2
+POLL_TIMEOUT_SECONDS = 60
+
+
+async def wait_for_result(candidate_id: uuid.UUID) -> Candidate:
+    elapsed = 0
+    while elapsed < POLL_TIMEOUT_SECONDS:
+        async with SessionLocal() as session:
+            candidate = await session.get(Candidate, candidate_id)
+            if candidate.status in TERMINAL_STATUSES:
+                return candidate
+            print(f"  ...status={candidate.status}, waiting")
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        elapsed += POLL_INTERVAL_SECONDS
+    raise TimeoutError(f"Candidate {candidate_id} did not reach a terminal status within {POLL_TIMEOUT_SECONDS}s")
 
 
 async def main():
@@ -38,22 +61,18 @@ async def main():
     file_type = file_path.suffix.lstrip(".").lower()
 
     async with SessionLocal() as session:
-        # 1. throwaway agent (FK requires one)
         agent = Agent(name=f"scratch-test-agent-{uuid.uuid4()}", api_key_hash="unused", role="test")
         session.add(agent)
-        await session.flush()  # get agent.id without committing yet
+        await session.flush()
 
-        # 2. request_log row, status="pending" — written before any real work, per decision #6
         request_log = RequestLog(agent_id=agent.id, status="pending")
         session.add(request_log)
         await session.flush()
 
-        # 3. upload the real file to MinIO
         candidate_id = uuid.uuid4()
         storage_key = upload_file(str(candidate_id), file_path.name, file_bytes)
         print(f"Uploaded. storage_key = {storage_key}")
 
-        # 4. candidate row, status="queued" — exactly what the real route will do
         candidate = Candidate(
             id=candidate_id,
             request_id=request_log.id,
@@ -61,6 +80,7 @@ async def main():
             file_type=file_type,
             storage_bucket=settings.minio_bucket,
             storage_key=storage_key,
+            jd_text=JD_TEXT,
             status="queued",
         )
         session.add(candidate)
@@ -68,11 +88,32 @@ async def main():
 
         print(f"Created candidate row: {candidate_id}")
 
-    # 5. enqueue the arq job
     redis_pool = await create_pool(RedisSettings.from_dsn(settings.arq_redis_url))
     await redis_pool.enqueue_job("process_candidate", str(candidate_id))
     print(f"Enqueued job for candidate {candidate_id}")
-    print("Now check the worker's logs, and query the candidates row to see it update.")
+
+    print("Waiting for worker to finish...")
+    try:
+        result = await wait_for_result(candidate_id)
+    except TimeoutError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+    print("-" * 60)
+    if result.status == "done":
+        print(f"✅ SUCCESS — status: done")
+        print(f"   is_resume: {result.is_resume}")
+        print(f"   jd_valid: {result.jd_valid}")
+        print(f"   score: {result.score}")
+        print(f"   reasoning: {result.score_reasoning}")
+    elif result.status == "rejected_not_resume":
+        print(f"⚠️  REJECTED — status: rejected_not_resume")
+        print(f"   is_resume: {result.is_resume}")
+        print(f"   jd_valid: {result.jd_valid}")
+        print(f"   reasoning: {result.score_reasoning}")
+    else:
+        print(f"❌ FAILED — status: {result.status}")
+        print(f"   error_detail: {result.error_detail}")
 
 
 if __name__ == "__main__":

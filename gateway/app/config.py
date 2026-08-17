@@ -12,6 +12,8 @@ class Settings(BaseSettings):
 
     arq_redis_url: str = "redis://redis:6379/1"
 
+    groq_api_key: str
+
     class Config:
         env_file = ".env"
 
