@@ -114,6 +114,7 @@ async def main():
     else:
         print(f"❌ FAILED — status: {result.status}")
         print(f"   error_detail: {result.error_detail}")
+        print(f"Done")
 
 
 if __name__ == "__main__":
