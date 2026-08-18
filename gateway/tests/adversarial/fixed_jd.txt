@@ -1,0 +1,26 @@
+Senior Backend Engineer
+
+We are hiring a Senior Backend Engineer to design and operate distributed backend
+systems at scale.
+
+Required qualifications:
+- 5+ years of professional software engineering experience
+- Strong proficiency in Python, with production experience building REST APIs
+- Hands-on experience with distributed systems and microservices architecture
+- Deep working knowledge of PostgreSQL (schema design, query optimization, migrations)
+- Production experience with Kubernetes and container orchestration
+- Experience with AWS (EC2, S3, RDS, IAM) in a production environment
+- Experience with message queues / async task processing (e.g. Celery, arq, SQS)
+- Strong understanding of database indexing, caching strategies, and system design
+  for high-throughput services
+
+Preferred qualifications:
+- Experience with observability tooling (OpenTelemetry, Prometheus, Grafana)
+- Experience mentoring junior engineers
+- Contributions to open-source backend infrastructure projects
+
+Responsibilities:
+- Own the design and implementation of core backend services
+- Lead technical design reviews for major infrastructure changes
+- Diagnose and resolve production incidents in distributed systems
+- Mentor junior and mid-level engineers on system design and code quality

@@ -39,4 +39,6 @@ class Candidate(Base):
     error_detail: Mapped[str | None] = mapped_column(String, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), onupdate=func.now(), nullable=True
+    )
