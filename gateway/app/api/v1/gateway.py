@@ -1,7 +1,7 @@
 import uuid
 import time
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from arq.connections import RedisSettings, create_pool
 
@@ -23,6 +23,7 @@ ALLOWED_EXTENSIONS = {"pdf", "docx"}
 
 @router.post("/screen", response_model=ScreenResponse, status_code=202)
 async def screen_resume(
+    request: Request,
     resume: UploadFile = File(...),
     jd_text: str = Form(...),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -75,8 +76,7 @@ async def screen_resume(
     request_log.candidate_id = candidate_id
 
     try:
-        redis_pool = await create_pool(RedisSettings.from_dsn(settings.arq_redis_url))
-        await redis_pool.enqueue_job("process_candidate", str(candidate_id))
+        await request.app.state.arq_pool.enqueue_job("process_candidate", str(candidate_id))
     except Exception as e:
         mark_error(request_log, timer, f"Enqueue failed: {e}")
         await session.commit()
