@@ -45,7 +45,7 @@ Not to finish a demo. To become a production-grade AI engineer who can:
 ## Phases
 
 - Phase 0 — Skeleton & contracts ✅ **done**
-- Phase 1 — Baseline resume screener (naive, unguarded) — deliberately vulnerable control group
+- Phase 1 — Baseline resume screener (naive, unguarded) — deliberately vulnerable control group. ✅ **done**
 - Phase 2 — Adversarial eval dataset (defines "success" before any defense is built)
 - Phase 3 — Input guardrails at the gateway (PII scrubbing, injection classifier)
 - Phase 4 — Multi-agent decomposition + MCP tool layer
@@ -173,3 +173,296 @@ Phase 0 complete: three services running via Docker Compose, schema
 applied via a reviewed Alembic migration, `/health` endpoint confirms
 FastAPI ↔ Postgres ↔ Redis connectivity across the real container
 network boundary.
+
+
+# Phase 1 — Baseline Resume Screener (Naive, Unguarded)
+
+## What We Built
+
+A full async pipeline: client uploads a resume (PDF/docx) + pastes a job
+description → gateway validates, stores, and enqueues → a separate worker
+process downloads, extracts text, calls an LLM to score fit, and writes
+the result → client polls for the outcome. No guardrails anywhere in this
+path — this is the deliberately naive control group Phase 2's eval suite
+will measure improvements against.
+
+## `Base` (DeclarativeBase) relocated to `app/core/db.py`
+
+Originally lived inline in `models/request_log.py`. When `models/candidate.py`
+was added, Alembic's `env.py` only imported `Base` from `request_log.py` —
+so `Candidate` never got registered onto `Base.metadata` (a class only
+attaches to metadata when its module is actually imported/executed), and
+`alembic revision --autogenerate` silently produced empty migrations with
+no error. Fixed by moving `Base` to the neutral, infra-appropriate
+`core/db.py`, and centralizing all model imports in `app/models/__init__.py`
+so any future model only needs one line added there — `env.py` now imports
+`Base` from `core/db.py` plus does `import app.models` purely for its
+metadata-registration side effect, and never needs touching again per new
+model.
+
+## File upload chosen over pasted-text ingestion
+
+More realistic (real screening systems take files, not JSON blobs), and
+more relevant to the actual threat model — indirect prompt injection via
+hidden text is far easier to demonstrate inside a PDF/docx (invisible text,
+tiny fonts, text boxes) than inside plain pasted text. Directly serves
+Phase 2's adversarial dataset.
+
+## Raw file bytes stored, not just extracted text
+
+Enables re-parsing later with a better library (e.g. `pypdf` → `pdfplumber`)
+without needing the client to re-upload. Same reasoning as keeping durable
+source data around rather than only derived data.
+
+## MinIO for object storage, accessed via `boto3` (not the `minio` SDK)
+
+MinIO is S3-API-compatible. Using `boto3` — AWS's own SDK — means the exact
+same code works against real AWS S3 in Phase 8 with only an endpoint URL
+and credential change. Using MinIO's own SDK would have required a rewrite
+later, defeating the reason MinIO was chosen as a local stand-in in the
+first place. Bucket key shape: `{candidate_id}/{original_filename}`, single
+bucket, no per-environment separation yet (deferred to Phase 8).
+`ensure_bucket_exists()` self-heals (creates the bucket on first use if
+missing) rather than requiring a manual setup step.
+
+## `arq` chosen over Celery + RabbitMQ
+
+Celery's default task execution model is synchronous — task functions are
+plain `def`, not `async def`. This codebase's DB access (async SQLAlchemy)
+and LLM calls are async-native throughout; using Celery would mean either
+wrapping every async call in `asyncio.run()` inside sync task functions, or
+maintaining a parallel sync version of shared service code. `arq` is
+async-native by design — task functions are `async def` and directly reuse
+the same session/client code the gateway already uses. Important nuance:
+this friction is isolated to the worker's *task execution model* —
+RabbitMQ vs. Redis as the broker has zero bearing on it; enqueueing a job
+is always a fast, non-blocking network call regardless of broker.
+
+## Worker runs as a separate Docker container, same codebase — not a separate repo
+
+Scaling is decided by container/service separation (`docker-compose up
+--scale worker=N`), not by folder structure. A separate codebase for the
+worker would only add cost (duplicated models, duplicated config, a
+code-sharing problem to solve) with zero scaling benefit, since containers
+already scale independently regardless of whether source lives in one
+folder or two. Standard real-world pattern: one image, one Dockerfile,
+`CMD` overridden per deployment target (`uvicorn` for gateway, `arq` for
+worker).
+
+## Async job architecture chosen deliberately, to learn it
+
+Sync-blocking processing was the simpler option; async queue-based
+processing was chosen specifically as a deliberate complexity trade for
+depth, matching the project's explicit goal of learning real distributed-
+systems patterns, not shipping the fastest demo.
+
+## Gateway and worker never talk to each other directly
+
+They communicate only through shared state: the `candidates` row in
+Postgres (source of truth for job status) and the Redis queue (the
+handoff mechanism). This is what makes independent horizontal scaling
+possible — neither process needs to know how many instances of the other
+exist.
+
+## `extract_text()` is synchronous; caller offloads via `asyncio.to_thread()`
+
+`pypdf`/`python-docx` are CPU-bound, blocking libraries with nothing to
+`await` internally — wrapping the function itself in `async def` would be
+misleading. Instead, the function stays plain `def`, and every caller
+(the worker task) wraps calls in `asyncio.to_thread()` so arq's event loop
+stays free to work on other concurrent jobs. The same pattern is applied
+to `storage.download_file()` and `screening.score_resume()` inside
+`worker.py`, since both are also synchronous, blocking network calls.
+
+## `extract_text()` raises exceptions, doesn't return error tuples
+
+Matches the existing project philosophy that errors are operational
+signal, not something to swallow. Custom exceptions
+(`UnsupportedFileTypeError`, `ExtractionFailedError`, and later
+`StorageError`, `ScoringError`, `IdempotencyError`) are centralized under
+one shared `GuardScreenError` base class in `app/core/exceptions.py`, so
+callers can catch broadly (`except GuardScreenError`) or narrowly
+(`except ExtractionFailedError`), and Phase 2's eval harness has one
+consistent exception vocabulary to categorize failures against across the
+whole pipeline.
+
+## `extract_text()` makes no judgment about "is this enough text"
+
+Kept single-purpose: pure extraction only. The decision of whether a
+result is too short (likely a scanned PDF with no text layer) lives one
+level up, in `worker.py` (`MIN_WORDS_BEFORE_OCR_FALLBACK = 20`). No OCR
+fallback was built this phase — a scanned PDF is detected and the
+candidate is marked `status="failed"` with a clear `error_detail`, rather
+than silently producing a meaningless score. Deliberately deferred, not
+an oversight; documented as a known limitation.
+
+## `python-docx` and `pypdf` have known extraction limitations
+
+`python-docx` only reads `doc.paragraphs` — it will not pick up text
+inside tables, headers/footers, or text boxes, meaning table-based resume
+layouts (e.g. skills grids) will have incomplete extraction. `pypdf` was
+also observed to introduce minor artifacts (stray spaces, mid-word line
+breaks) on some real PDFs during testing. Both are known, accepted
+Phase 1 limitations — `pdfplumber` was identified as a fallback option if
+either becomes a real problem for Phase 2's eval data, but not adopted now.
+
+## `candidates` table added, with `request_log.candidate_id`'s deferred FK
+
+`candidates` stores: raw file location (`storage_bucket`/`storage_key`,
+not raw bytes in Postgres), `original_filename`, `file_type`,
+`extracted_text`, the client-submitted `jd_text`, LLM judgments
+(`is_resume`, `jd_valid`), the naive score (`score`, `score_reasoning`),
+and a pipeline `status`. Adding this table also let us finally add the FK
+constraint on `request_log.candidate_id` that Phase 0 deliberately left
+nullable/unconstrained, since the referenced table didn't exist yet — both
+changes landed in one migration, since they're logically one change.
+
+## `jd_text` is required (NOT NULL), not optional
+
+A null JD would let the system silently produce a meaningless score.
+Rejected at the route level (400) if missing/blank instead. This decision
+required wiping existing test data and adding the column as `NOT NULL`
+directly, rather than the safer nullable-then-backfill pattern — acceptable
+here because the data was disposable local test data, not anything real.
+
+## `jd_valid` added as its own boolean column, alongside `is_resume`
+
+Caught during testing: nothing was checking whether the client-submitted
+JD text was itself genuine, only whether the uploaded file was a real
+resume. Rather than a separate heuristic pre-filter, the LLM judges JD
+validity in the *same* combined call as resume validity and scoring —
+consistent with the "naive baseline, no pre-filtering heuristics"
+approach, and avoids a second API call. Verified directly: a real resume
+against a garbage JD correctly returns `is_resume=True, jd_valid=False,
+score=0`, and a garbage document against a real JD correctly returns
+`is_resume=False, jd_valid=True, score=0` — the two failure modes are
+distinguishable via the booleans even though `status` collapses both into
+the same `"rejected_not_resume"` value.
+
+## `score` is a plain Float, `score_reasoning` is plain Text — not structured
+
+No JSON breakdown (e.g. `{strengths, gaps}`). Consequence accepted
+explicitly: Phase 2's eval harness will be able to judge whether the naive
+score was too high or too low, but not easily judge *why*, unless a raw
+LLM-response log is added later as a cheap follow-up.
+
+## Groq chosen as the LLM provider; one combined call, plain JSON output
+
+A single call returns `{is_resume, jd_valid, score, reasoning}` as JSON,
+parsed with plain `json.loads()` — no structured-output/tool-calling
+enforcement. Deliberately naive: brittleness on malformed JSON is honest
+signal for Phase 2's evals to measure, not something to guardrail away
+this early. `ScoringError` is raised on parse failure or missing expected
+fields, no silent defaults. Note this single-call design is explicitly
+*not* how Phase 4's real Parser/Scorer agent split will work — the Scorer
+there will only ever see the Parser's structured output, never raw resume
+text, as the core injection defense. The scoring model changed mid-phase
+(`llama-3.3-70b-versatile` → `openai/gpt-oss-120b`, both Groq-hosted, same
+client interface) due to hitting free-tier rate limits during testing —
+worth remembering if comparing future eval numbers against "the Phase 1
+baseline," since the model itself isn't held constant across this phase's
+own development.
+
+## Auth: seeded single test agent, `X-API-Key` header, SHA-256 hash
+
+Real per-request auth was a hard requirement (routes need a valid
+`agent_id` to write `request_log` rows), but full production-grade auth
+(bcrypt/argon2 hashing, key rotation, multiple real agents) was explicitly
+deferred. One agent is seeded via a throwaway script that prints its raw
+API key exactly once (only the hash is stored). `GET
+/v1/screen/{candidate_id}` requires a valid key but does not enforce that
+the requesting agent owns that candidate — any authenticated agent can
+poll any candidate_id. Both gaps are accepted, documented Phase 1
+limitations, not oversights.
+
+## `request_log.status` tracks only the gateway request outcome
+
+Explicitly scoped to mean "did we successfully validate, upload, and
+enqueue this request" (`pending` → `success`/`error`) — not the async
+pipeline's eventual outcome, which is `candidates.status`'s job. Avoids
+either blocking the HTTP response on the worker finishing (defeating the
+whole point of async processing) or coupling the worker back to
+gateway-owned audit data.
+
+## Idempotency: optional client-supplied `Idempotency-Key` header, Redis SETNX
+
+Implements Phase 0's original decision to enforce idempotency in Redis
+before any expensive work happens. `redis_client.set(..., nx=True, ex=TTL)`
+is Redis's atomic check-and-set — avoids a race condition a separate
+check-then-set would have under concurrent requests. On a duplicate key,
+the route returns the *existing* candidate's live status rather than
+re-doing any work; verified directly by sending two identical requests
+with the same key and confirming both returned the same `candidate_id`,
+with the second reflecting real-time state (`"done"`) rather than
+retriggering processing. `request_log.idempotency_key` is still populated
+on every request regardless, purely for querying/debugging — same as
+Phase 0's original note that this column was never meant to be the
+enforcement mechanism itself. `candidate_id` is generated up front, before
+knowing whether the request is a duplicate, since the reservation call
+needs some ID to reserve against; a discarded UUID on the duplicate path
+is an accepted minor inefficiency.
+
+## `services/audit.py` is deliberately thin, does not commit
+
+`mark_success()`/`mark_error()` only mutate the in-memory `RequestLog`
+object; the route retains full control of its own session/commit
+lifecycle. A `RequestTimer` (wrapping `time.monotonic()`) is instantiated
+at the top of the route handler to compute `latency_ms` at whichever
+terminal point the request reaches.
+
+## Shared arq pool via FastAPI lifespan, not per-request `create_pool()`
+
+Originally, `create_pool()` was called fresh on every `POST /v1/screen`
+request, opening a new Redis connection pool each time — flagged early as
+a known inefficiency and deliberately left unfixed until the rest of the
+route was proven correct, per an incremental build preference. Fixed at
+the end of Phase 1: the pool is created once at app startup via FastAPI's
+`lifespan` context manager, stored on `app.state.arq_pool`, reused by
+every request, and closed cleanly on shutdown.
+
+## Postgres/Redis/MinIO connection limits — understood, deliberately untuned
+
+A detailed question about concurrent load from both gateway and worker
+processes surfaced real distinctions worth recording: Postgres has a hard
+`max_connections` ceiling with no graceful queuing past it — connections
+are *rejected*, not queued, once exceeded; any queuing that does happen is
+client-side, inside SQLAlchemy's own connection pool (defaults:
+`pool_size`≈5, `max_overflow`≈10, `pool_timeout`≈30s), not inside Postgres
+itself. MinIO has no equivalent hard connection ceiling — it degrades in
+latency under load instead — but the `boto3` client has its own
+client-side pool (default 10 connections) that queues independently.
+Explicitly concluded this is not a Phase 1 problem at current
+single-developer, local scale, and deferred to Phase 7/8 as a documented,
+understood gap rather than an unknown one.
+
+## Recurring gotcha: host vs. container DNS, now hit three times
+
+Same root cause as Phase 0's original Postgres issue, recurring for every
+new external service added this phase (MinIO, then arq's Redis DB): a
+hostname that resolves inside the Docker network (`minio`, `redis`) means
+nothing on the host Mac, which only knows `localhost`. Every new external
+dependency needs its connection config added to *both* `.env` files —
+root `.env` (container-facing) and `gateway/.env` (host-only, for
+scratch scripts and Alembic run directly from the Mac) — or host-side
+scripts fail with DNS resolution errors. Worth checking for on any future
+new service, not just repeating the fix reactively each time.
+
+## `docker-compose up` can silently run a stale image after a failed build
+
+Discovered when a mistyped dependency pin (`groq==0.1.6`, a nonexistent
+version — transposition of the intended `1.6.0`) caused a build failure,
+but `docker-compose up -d` still reported the container as "Started,"
+because it silently fell back to whatever image had been built
+previously. The failed build wasn't obvious from `up`'s own output —
+worth explicitly checking build success (not just container "Started"
+status) whenever `requirements.txt` changes.
+
+## Status
+
+Phase 1 complete: full async pipeline verified end-to-end through real
+testing at every layer — parsing, storage, screening, worker (both
+success and rejection paths), the `POST`/`GET` routes, idempotency, and
+audit logging. Deliberately naive throughout (no OCR, no retries,
+SHA-256 not bcrypt, no GET ownership enforcement, non-streamed size cap,
+no structured LLM output) — this is the intended unguarded control group
+Phase 2's adversarial eval suite will measure improvements against.
